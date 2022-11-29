@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -14,6 +15,7 @@ import (
 	"net"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/golang/snappy"
 	"golang.org/x/crypto/sha3"
 
 	"github.com/indexsupply/x/bint"
@@ -157,12 +159,12 @@ func (ms *mstate) frame(fct []byte) []byte {
 	return ms.hash.Sum(nil)[:16]
 }
 
-func (s *session) decode(buf []byte) (byte, rlp.Item, error) {
+func (s *session) unframe(buf []byte) (byte, []byte, error) {
 	if len(buf) < 32 {
-		return 0, rlp.Item{}, errors.New("buf too small for 32byte header")
+		return 0, nil, errors.New("buf too small for 32byte header")
 	}
 	if !hmac.Equal(s.ig.header(buf[:16]), buf[16:32]) {
-		return 0, rlp.Item{}, errors.New("invalid header mac")
+		return 0, nil, errors.New("invalid header mac")
 	}
 	s.ig.stream.XORKeyStream(buf[:16], buf[:16])
 	var (
@@ -172,12 +174,10 @@ func (s *session) decode(buf []byte) (byte, rlp.Item, error) {
 		frameMac  = buf[frameEnd : frameEnd+16]
 	)
 	if !hmac.Equal(s.ig.frame(frame), frameMac) {
-		return 0, rlp.Item{}, errors.New("invalid frame mac")
+		return 0, nil, errors.New("invalid frame mac")
 	}
 	s.ig.stream.XORKeyStream(frame, frame)
-	code := frame[0:1]
-	item, err := rlp.Decode(frame[1:frameSize])
-	return code[0], item, isxerrors.Errorf("rlp decoding frame: %w", err)
+	return frame[0:1][0], frame[1:frameSize], nil
 }
 
 // Encodees data into an RLPx frame
@@ -191,7 +191,7 @@ func (s *session) decode(buf []byte) (byte, rlp.Item, error) {
 // header-padding = zero-fill header to 16-byte boundary
 // frame-ciphertext = aes(aes-secret, frame-data || frame-padding)
 // frame-padding = zero-fill frame-data to 16-byte boundary
-func (s *session) encode(msgID byte, msgData []byte) []byte {
+func (s *session) frame(msgID byte, msgData []byte) []byte {
 	// Per the spec, the header contains: size, data, and padding.
 	// However, the data (eg [capability-id, context-id]) is unused.
 	// Therefore, we leave the header-data as a list of zero bytes.
@@ -215,30 +215,24 @@ func (s *session) encode(msgID byte, msgData []byte) []byte {
 	return frame
 }
 
-func (s *session) Hello() ([]byte, error) {
-	return s.encode(0x00, rlp.Encode(rlp.List(
-		rlp.Int(5),
-		rlp.String("indexsupply/0"),
-		rlp.List(
-			rlp.String("p2p"),
-			rlp.Int(5),
-		),
-		rlp.Uint16(s.local.TcpPort),
-		rlp.Secp256k1PublicKey(s.local.PublicKey),
-	))), nil
+func (s *session) encode(msgID byte, item rlp.Item) []byte {
+	return frame(msgID, snappy.Encode(nil, rlp.Encode(item)))
 }
 
-func (s *session) HandleHello(d []byte) error {
-	_, item, err := s.decode(d)
+func (s *session) decode(d []byte) (byte, rlp.Item, error) {
+	msgID, c, err := unframe(d)
 	if err != nil {
-		return isxerrors.Errorf("decoding hello frame: %w", err)
+		return 0, nil, isxerrors.Errorf("unframing msg: %w", err)
 	}
-	id, err := item.At(1).String()
+	uc, err := snappy.Decode(nil, c)
 	if err != nil {
-		return isxerrors.Errorf("reading id: %w", err)
+		return 0, nil, isxerrors.Errorf("decompressing msg data: %w", err)
 	}
-	s.log("hello from %s\n", id)
-	return nil
+	item, err := rlp.Decode(uc)
+	if err != nil {
+		return 0, nil, isxerrors.Errorf("decoding msg into an rlp item: %w", err)
+	}
+	return msgID, item, nil
 }
 
 type handshake struct {
@@ -431,4 +425,124 @@ func (h *handshake) HandleAck(d []byte) error {
 	}
 	h.recipientNonce, err = ackItem.At(1).Bytes32()
 	return err
+}
+
+func (s *session) Listen(c net.Conn) {
+	buf := make([]byte, 1<<14)
+	for {
+		n, err := c.Read(buf)
+		if err != nil {
+			s.log("err-read: %s\n", err)
+			return
+		}
+		err = s.handle(c, buf[:n])
+		if err != nil {
+			s.log("err-handle: %s\n", err)
+		}
+	}
+}
+
+const (
+	hello = 0x00
+	disc  = 0x01
+	ping  = 0x02
+	pong  = 0x03
+
+	status          = 0x10
+	newBlockhash    = 0x11
+	getBlockHeaders = 0x13
+	headersID       = 0x14
+)
+
+func (s *session) handle(c net.Conn, b []byte) error {
+	id, item, err := s.decode(b)
+	if err != nil {
+		return isxerrors.Errorf("decoding frame: %w", err)
+	}
+	switch id {
+	case hello:
+	case disc:
+		s.handleDisconnect(item)
+	case ping:
+		s.handlePing()
+	case pong:
+		s.log("<pong")
+	case status:
+		s.handleStatus(item)
+	case getBlockHeaders:
+		s.handleGetHeaders(item)
+	default:
+		fmt.Printf("un-handled id: %x\n", id)
+	}
+	return nil
+}
+
+func (s *session) Hello() ([]byte, error) {
+	// hello is the only message that isn't compressed
+	return s.encode(0x00, rlp.Encode(rlp.List(
+		rlp.Int(5),
+		rlp.String("indexsupply/0"),
+		rlp.List(
+			rlp.List(rlp.String("p2p"), rlp.Int(5)),
+			rlp.List(rlp.String("eth"), rlp.Int(67)),
+		),
+		rlp.Uint16(s.local.TcpPort),
+		rlp.Secp256k1PublicKey(s.local.PublicKey),
+	))), nil
+}
+
+func (s *session) HandleHello(d []byte) error {
+	// hello is the only message that isn't compressed
+	_, b, err := s.unframe(d)
+	if err != nil {
+		return isxerrors.Errorf("decoding hello frame: %w", err)
+	}
+	item, err := rlp.Decode(b)
+	if err != nil {
+		return isxerrors.Errorf("decoding rlp: %w", err)
+	}
+	id, err := item.At(1).String()
+	if err != nil {
+		return isxerrors.Errorf("reading id: %w", err)
+	}
+	s.log("hello from %s\n", id)
+	return nil
+}
+
+func (s *session) handlePing() {
+	s.conn.Write(s.encode(pong, rlp.List()))
+}
+
+func (s *session) handleDisconnect(item rlp.Item) {
+	defer s.conn.Close()
+	b, _ := item.Bytes()
+	s.log("disconnect reason: %x\n", b)
+}
+
+func (s *session) handleGetHeaders(item rlp.Item) uint64 {
+	reqID, _ := item.At(0).Uint64()
+	headers := s.encode(0x14, rlp.List(
+		rlp.Uint64(reqID),
+		rlp.List(),
+	))
+	s.log("<get-headers: %d\n", reqID)
+	s.conn.Write(headers)
+}
+
+func (s *session) handleStatus(item rlp.Item) {
+	bh, _ := item.At(3).Bytes()
+	s.log("status: %x\n", bh)
+}
+
+func (s *session) Status() ([]byte, error) {
+	g, _ := hex.DecodeString("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
+	f, _ := hex.DecodeString("fc64ec04")
+	return s.encode(0x10, rlp.List(
+		rlp.Int(67),
+		rlp.Int(1),
+		rlp.Int(17179869184),
+		rlp.Bytes(g[:]),
+		rlp.Bytes(g[:]),
+		rlp.List(rlp.Bytes(f), rlp.Int(1150000)),
+	)), nil
 }

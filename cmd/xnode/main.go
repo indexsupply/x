@@ -115,5 +115,8 @@ func main() {
 
 	rw.Write(rs.Hello)
 	rw.Read(rs.HandleHello)
+	rw.Write(rs.Status)
 	check(rw.err)
+	go rs.Listen(conn)
+	select {}
 }

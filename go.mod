@@ -9,4 +9,7 @@ require (
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2
 )
 
-require golang.org/x/sys v0.1.0 // indirect
+require (
+	github.com/golang/snappy v0.0.4 // indirect
+	golang.org/x/sys v0.1.0 // indirect
+)
